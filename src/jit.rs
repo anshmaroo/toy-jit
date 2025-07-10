@@ -1,7 +1,9 @@
+use cranelift::prelude::isa::aarch64::inst::Cond;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
 use std::collections::HashMap;
+use std::i64;
 use std::mem::offset_of;
 
 use crate::block::Block;
@@ -48,8 +50,13 @@ impl Default for JIT {
     }
 }
 
+enum ControlFlowType {
+    Sequential(u64),
+    Jump(Value),
+    End(Value),
+}
 impl JIT {
-    pub fn build_block(&mut self, rom: &[u32], start_pc: u64, length: u64) -> Result<*const u8, String> {
+    pub fn build_block(&mut self, rom: &[u32], start_pc: u64) -> Result<*const u8, String> {
         // push a pointer to the cpu as an input, new pc as output
         self.ctx
             .func
@@ -69,22 +76,32 @@ impl JIT {
         builder.switch_to_block(entry_block);
         builder.append_block_params_for_function_params(entry_block);
 
-        for i in start_pc..(start_pc + length) {
-            // translate instructions here
-            Self::translate(&mut builder, rom, i);
+        let mut i = start_pc;
+        let mut end_pc;
+        loop {
+            match Self::translate(&mut builder, rom, i) {
+                ControlFlowType::Sequential(new_pc_val) => i = new_pc_val,
+                ControlFlowType::Jump(new_pc_val) | ControlFlowType::End(new_pc_val) => {
+                    end_pc = new_pc_val;
+                    break;
+                }
+            }
         }
 
-        let new_pc = builder.ins().iconst(types::I64, (start_pc + length) as i64); // placeholder or actual PC logic
-        builder.ins().return_(&[new_pc]);
-
+        builder.ins().return_(&[end_pc]);
         builder.seal_all_blocks();
         builder.finalize();
 
         // declare the function
-        let id = self.module.declare_anonymous_function(&self.ctx.func.signature).map_err(|e| e.to_string())?;
+        let id = self
+            .module
+            .declare_anonymous_function(&self.ctx.func.signature)
+            .map_err(|e| e.to_string())?;
 
         // define the function to jit
-        self.module.define_function(id, &mut self.ctx).map_err(|e| e.to_string())?;
+        self.module
+            .define_function(id, &mut self.ctx)
+            .map_err(|e| e.to_string())?;
 
         // Now that compilation is finished, we can clear out the context state.
         self.module.clear_context(&mut self.ctx);
@@ -92,64 +109,120 @@ impl JIT {
         self.module.finalize_definitions().unwrap();
 
         let code = self.module.get_finalized_function(id);
-        Ok(code)
 
+        Ok(code)
     }
 
-    fn translate(builder: &mut FunctionBuilder, rom: &[u32], pc: u64) {
+    fn translate(builder: &mut FunctionBuilder, rom: &[u32], pc: u64) -> ControlFlowType {
         let cpu_ptr = builder.block_params(builder.current_block().expect("err"))[0];
-        let insn = Insn::from_bits(rom[pc as usize]);
-        let bits = insn.bits();
-        let rd = insn.rd() as usize;
-        let rs1 = insn.rs1() as usize;
-        let rs2 = insn.rs2() as usize;
+        if pc >> 2 < rom.len() as u64 {
+            let insn = Insn::from_bits(rom[(pc >> 2) as usize]);
+            let bits = insn.bits();
+            let length = if (insn.bits() & 0b11 == 0b11) { 4 } else { 2 };
+            let mut flow_type = ControlFlowType::Sequential(pc + length);
 
-        let rs1_offset = offset_of!(Cpu, regs) + rs1 * 8;
-        let rs2_offset = offset_of!(Cpu, regs) + rs2 * 8;
-        let rd_offset = offset_of!(Cpu, regs) + rd * 8;
+            let rd = insn.rd() as usize;
+            let rs1 = insn.rs1() as usize;
+            let rs2 = insn.rs2() as usize;
+            let bimm12hi = insn.bimm12hi();
+            let bimm12lo = insn.bimm12lo();
 
-        if bits & 0xfe00707f == 0x33 {
-            // add
-            let rs1_value =
+            let rs1_offset = offset_of!(Cpu, regs) + rs1 * 8;
+            let rs2_offset = offset_of!(Cpu, regs) + rs2 * 8;
+            let rd_offset = offset_of!(Cpu, regs) + rd * 8;
+
+            let branch_offset = Insn::sign_extend(
+                ((bimm12hi & 0x40) << 6)
+                    | ((bimm12lo & 0x01) << 11)
+                    | ((bimm12hi & 0x3F) << 5)
+                    | (bimm12lo & 0x1E),
+                13,
+            );
+
+            if bits & 0xfe00707f == 0x33 {
+                // add
+                let rs1_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs1_offset as i32);
+                let rs2_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs2_offset as i32);
+                let result = builder.ins().iadd(rs1_value, rs2_value);
                 builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), cpu_ptr, rs1_offset as i32);
-            let rs2_value =
+                    .store(MemFlags::new(), result, cpu_ptr, rd_offset as i32);
+            } else if bits & 0xfe00707f == 0x7033 {
+                // and
+                let rs1_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs1_offset as i32);
+                let rs2_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs2_offset as i32);
+                let result = builder.ins().band(rs1_value, rs2_value);
                 builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), cpu_ptr, rs2_offset as i32);
-            let result = builder.ins().iadd(rs1_value, rs2_value);
-            builder
-                .ins()
-                .store(MemFlags::new(), result, cpu_ptr, rd_offset as i32);
-        } else if bits & 0xfe00707f == 0x7033 {
-            // and
-            let rs1_value =
+                    .store(MemFlags::new(), result, cpu_ptr, rd_offset as i32);
+            } else if bits & 0xfe00707f == 0x1033 {
+                // sll
+                let rs1_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs1_offset as i32);
+                let rs2_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs2_offset as i32);
+                let result = builder.ins().ishl(rs1_value, rs2_value);
                 builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), cpu_ptr, rs1_offset as i32);
-            let rs2_value =
+                    .store(MemFlags::new(), result, cpu_ptr, rd_offset as i32);
+            } else if bits & 0x707f == 0x1063 {
+                // bne
+                let rs1_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs1_offset as i32);
+                let rs2_value =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), cpu_ptr, rs2_offset as i32);
+
+                // perform comparison
+                let condition = builder.ins().icmp(IntCC::NotEqual, rs1_value, rs2_value);
+
+                // define blocks
+                let taken_block = builder.create_block();
+                let not_taken_block = builder.create_block();
+
+                // taken or not taken path
                 builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), cpu_ptr, rs2_offset as i32);
-            let result = builder.ins().band(rs1_value, rs2_value);
-            builder
-                .ins()
-                .store(MemFlags::new(), result, cpu_ptr, rd_offset as i32);
-        } else if bits & 0xfe00707f == 0x1033 {
-            // sll
-            let rs1_value =
-                builder
-                    .ins()
-                    .load(types::I64, MemFlags::new(), cpu_ptr, rs1_offset as i32);
-            let rs2_value =
-                builder
-                    .ins()
-                    .load(types::I64, MemFlags::new(), cpu_ptr, rs2_offset as i32);
-            let result = builder.ins().ishl(rs1_value, rs2_value);
-            builder
-                .ins()
-                .store(MemFlags::new(), result, cpu_ptr, rd_offset as i32);
+                    .brif(condition, taken_block, &[], not_taken_block, &[]);
+
+                builder.switch_to_block(taken_block);
+                builder.seal_block(taken_block);
+                flow_type = ControlFlowType::Jump(
+                    builder
+                        .ins()
+                        .iconst(types::I64, pc.wrapping_add_signed(branch_offset) as i64),
+                );
+
+                builder.switch_to_block(not_taken_block);
+                builder.seal_block(not_taken_block);
+                flow_type = ControlFlowType::Jump(
+                    builder.ins().iconst(types::I64, pc.wrapping_add(4) as i64),
+                );
+            }
+
+            flow_type
+        } else {
+            let new_pc = builder.ins().iconst(types::I64, pc as i64);
+            return ControlFlowType::End(new_pc);
         }
     }
 }
