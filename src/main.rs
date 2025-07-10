@@ -7,20 +7,26 @@ mod jit;
 
 fn main() {
     let mut jit = JIT::default();
-    let rom = [0x003100b3, 0x003110b3, 0x000672b3];
+    let rom = [
+        0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3,
+        0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3, 0x001100b3,
+        0x001100b3,
+    ];
     let mut cpu = Cpu::default();
-    cpu.regs[2] = 12;
-    cpu.regs[3] = 14;
+    cpu.regs[2] = 1;
+    cpu.regs[0] = 0;
 
-    let function = jit
-        .build_block(&rom, cpu.pc, 1)
-        .expect("could not translate block");
+    while cpu.pc < rom.len() as u64 {
+        let function = jit
+            .build_block(&rom, cpu.pc, 5)
+            .expect("could not translate block");
 
-    // Cast and call the JIT-compiled function
-    let func: extern "C" fn(*mut Cpu) -> u64 = unsafe { std::mem::transmute(function) };
-    let new_pc = func(&mut cpu as *mut Cpu);
+        // Cast and call the JIT-compiled function
+        let func: extern "C" fn(*mut Cpu) -> u64 = unsafe { std::mem::transmute(function) };
+        let new_pc = func(&mut cpu as *mut Cpu);
 
-    cpu.pc = new_pc;
+        cpu.pc = new_pc;
 
-    println!("cpu state after running: {:?}", cpu);
+        println!("cpu state after running: {:?}", cpu);
+    }
 }

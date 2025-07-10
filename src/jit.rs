@@ -81,7 +81,7 @@ impl JIT {
         builder.finalize();
 
         // declare the function
-        let id = self.module.declare_function("block", Linkage::Export, &self.ctx.func.signature).map_err(|e| e.to_string())?;
+        let id = self.module.declare_anonymous_function(&self.ctx.func.signature).map_err(|e| e.to_string())?;
 
         // define the function to jit
         self.module.define_function(id, &mut self.ctx).map_err(|e| e.to_string())?;
