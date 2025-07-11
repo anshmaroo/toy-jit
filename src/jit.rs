@@ -10,6 +10,8 @@ use crate::block::Block;
 use crate::cpu::Cpu;
 use crate::insn::Insn;
 pub struct JIT {
+    // binary
+    rom: Vec<u32>,
     /// The function builder context, which is reused across multiple
     /// FunctionBuilder instances.
     builder_context: FunctionBuilderContext,
@@ -25,6 +27,9 @@ pub struct JIT {
     /// The module, with the jit backend, which manages the JIT'd
     /// functions.
     module: JITModule,
+
+    // block cache
+    pub block_cache: HashMap<u64, *const u8>
 }
 
 impl Default for JIT {
@@ -42,10 +47,12 @@ impl Default for JIT {
 
         let module = JITModule::new(builder);
         Self {
+            rom: Vec::default(),
             builder_context: FunctionBuilderContext::new(),
             ctx: module.make_context(),
             data_description: DataDescription::new(),
             module,
+            block_cache: HashMap::default()
         }
     }
 }
@@ -56,7 +63,13 @@ enum ControlFlowType {
     End(Value),
 }
 impl JIT {
-    pub fn build_block(&mut self, rom: &[u32], start_pc: u64) -> Result<*const u8, String> {
+    pub fn load_rom(&mut self, rom: &Vec<u32>) {
+        for i in rom {
+            self.rom.push(*i);
+        }
+    }
+
+    pub fn build_block(&mut self, rom: &[u32], start_pc: u64) {
         // push a pointer to the cpu as an input, new pc as output
         self.ctx
             .func
@@ -96,12 +109,14 @@ impl JIT {
         let id = self
             .module
             .declare_anonymous_function(&self.ctx.func.signature)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+            .expect("could not declare function!");
 
         // define the function to jit
         self.module
             .define_function(id, &mut self.ctx)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+            .expect("could not attach function to JIT!");
 
         // Now that compilation is finished, we can clear out the context state.
         self.module.clear_context(&mut self.ctx);
@@ -110,7 +125,7 @@ impl JIT {
 
         let code = self.module.get_finalized_function(id);
 
-        Ok(code)
+        self.block_cache.insert(start_pc, code);
     }
 
     fn translate(builder: &mut FunctionBuilder, rom: &[u32], pc: u64) -> ControlFlowType {
@@ -194,29 +209,13 @@ impl JIT {
 
                 // perform comparison
                 let condition = builder.ins().icmp(IntCC::NotEqual, rs1_value, rs2_value);
-
-                // define blocks
-                let taken_block = builder.create_block();
-                let not_taken_block = builder.create_block();
-
-                // taken or not taken path
-                builder
+                let taken_pc = builder
                     .ins()
-                    .brif(condition, taken_block, &[], not_taken_block, &[]);
+                    .iconst(types::I64, pc.wrapping_add_signed(branch_offset) as i64);
+                let not_taken_pc = builder.ins().iconst(types::I64, pc.wrapping_add(4) as i64);
+                let result_pc = builder.ins().select(condition, taken_pc, not_taken_pc);
 
-                builder.switch_to_block(taken_block);
-                builder.seal_block(taken_block);
-                flow_type = ControlFlowType::Jump(
-                    builder
-                        .ins()
-                        .iconst(types::I64, pc.wrapping_add_signed(branch_offset) as i64),
-                );
-
-                builder.switch_to_block(not_taken_block);
-                builder.seal_block(not_taken_block);
-                flow_type = ControlFlowType::Jump(
-                    builder.ins().iconst(types::I64, pc.wrapping_add(4) as i64),
-                );
+                flow_type = ControlFlowType::Jump(result_pc);
             }
 
             flow_type
